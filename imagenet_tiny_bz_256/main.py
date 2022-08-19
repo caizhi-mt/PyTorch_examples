@@ -25,7 +25,7 @@ import pdb
 from torch.utils.tensorboard import SummaryWriter
 
 # default `log_dir` is "runs" - we'll be more specific here
-writer = SummaryWriter('runs/gpu_imagenet_90_epoch')
+writer = SummaryWriter('runs/gpu_bz256_tiny_imagenet_90_epoch')
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -45,7 +45,7 @@ parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=8, type=int,
+parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -145,7 +145,7 @@ def main_worker(gpu, ngpus_per_node, args):
         model = models.__dict__[args.arch](pretrained=True)
     else:
         print("=> creating model '{}'".format(args.arch))
-        model = models.__dict__[args.arch]()
+        model = models.__dict__[args.arch](num_classes=200)
 
     if args.device == "mtgpu":
         model = model.to("mtgpu")
@@ -303,7 +303,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'scheduler' : scheduler.state_dict()
             }, is_best)
     # save the whole model
-    torch.save(model, 'gpu_model_imagenet_90_epoch.pth')
+    torch.save(model, 'gpu_model_bz256_tiny_imagenet_90_epoch.pth')
     #model = torch.load('model.pth')
 
 
