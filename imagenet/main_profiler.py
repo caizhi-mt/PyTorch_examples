@@ -24,6 +24,13 @@ from torch.utils.data import Subset
 import musa_torch_extension
 import pdb
 #from torch.utils.tensorboard import SummaryWriter
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
+
+def trace_handler(p):
+    output = p.key_averages(group_by_input_shape=True).table(sort_by="self_cuda_time_total", row_limit=100)
+    print(output)
+    p.export_chrome_trace("./bz_16_trace_" + str(p.step_num) + ".json")
+    torch.profiler.tensorboard_trace_handler('./LOG/TensorBD_bz_16')
 
 # default `log_dir` is "runs" - we'll be more specific here
 #writer = SummaryWriter('runs/mtgpu_tiny_imagenet_90_epoch')
@@ -46,7 +53,7 @@ parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=16, type=int,
+parser.add_argument('-b', '--batch-size', default=32, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -151,7 +158,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     if args.device == "mtgpu":
         model = model.to("mtgpu")
-    elif args.gpu is None:
+    elif not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -326,54 +333,64 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     tmp_iteration_num = 0
     tmp_real_num = 0
     tmp_total_time = 0.0
+    print("========informations=====",args.batch_size,args.device)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                 record_shapes=True,
+                 schedule=torch.profiler.schedule(
+                 wait=10,
+                 warmup=1,
+                 active=3,
+                 repeat=3),
+                 on_trace_ready=torch.profiler.tensorboard_trace_handler('./mtGPU_LOG/resnet50_bz32')) as p:
+        for i, (images, target) in enumerate(train_loader):
+            # measure data loading time
+            data_time.update(time.time() - end)
 
-    for i, (images, target) in enumerate(train_loader):
-        # measure data loading time
-        data_time.update(time.time() - end)
+            if args.gpu is not None:
+                images = images.cuda(args.gpu, non_blocking=True)
+            if torch.cuda.is_available():
+                target = target.cuda(args.gpu, non_blocking=True)
+            if args.device == "mtgpu":
+                images = images.to("mtgpu")
+                target = target.to("mtgpu")
 
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        if args.gpu is not None:
-            target = target.cuda(args.gpu, non_blocking=True)
-        if args.device == "mtgpu":
-            images = images.to("mtgpu")
-            target = target.to("mtgpu")
+            # compute output
+            output = model(images)
+            loss = criterion(output, target)
 
-        # compute output
-        output = model(images)
-        loss = criterion(output, target)
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
 
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+            # compute gradient and do SGD step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.to("cpu").item()
+            # measure elapsed time
+            #print("==train iteration time: ", time.time() - end)
+            batch_time.update(time.time() - end)
 
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.to("cpu").item()
-        # measure elapsed time
-        #print("==train iteration time: ", time.time() - end)
-        batch_time.update(time.time() - end)
-        tmp_iteration_num = tmp_iteration_num + 1
-        if tmp_iteration_num > 10:
-            tmp_total_time = tmp_total_time + time.time() - end
-            tmp_real_num = tmp_real_num + 1
-            if tmp_real_num == 10:
-                print("=====per step time:  ", tmp_total_time / tmp_real_num)
-                print("=====per epoch time:  ", tmp_total_time / tmp_real_num * 100000 / args.batch_size)
-                print("=====throughput:  ", args.batch_size / (tmp_total_time / tmp_real_num))
-                print("========informations=====",args.batch_size,args.device)
+            #tmp_iteration_num = tmp_iteration_num + 1
+            #if tmp_iteration_num > 20:
+            #    tmp_total_time = tmp_total_time + time.time() - end
+            #    tmp_real_num = tmp_real_num + 1
+            #    if tmp_real_num == 20:
+            #        print("=====per step time:  ", tmp_total_time / tmp_real_num)
+            #        print("=====per epoch time:  ", tmp_total_time / tmp_real_num * 100000 / args.batch_size)
+            #        print("=====throughput:  ", args.batch_size / (tmp_total_time / tmp_real_num))
 
-        end = time.time()
+            end = time.time()
 
-        if i % args.print_freq == 0:
-            progress.display(i + 1)
-        if i % 100 == 99:
-            #writer.add_scalar('training loss', running_loss / 100, epoch * len(train_loader) + i)
-            running_loss = 0.0
+            if i % args.print_freq == 0:
+                progress.display(i + 1)
+            if i % 100 == 99:
+                #writer.add_scalar('training loss', running_loss / 100, epoch * len(train_loader) + i)
+                running_loss = 0.0
+            musa_torch_extension.synchronize()
+            p.step()
 
 
 def validate(val_loader, model, criterion, args):

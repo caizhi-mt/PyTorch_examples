@@ -23,6 +23,13 @@ The default learning rate schedule starts at 0.1 and decays by a factor of 10 ev
 python main.py -a alexnet --lr 0.01 [imagenet-folder with train and val folders]
 ```
 
+
+## Profile
+Refer to ([mtPytorch Profile](https://confluence.mthreads.com/pages/viewpage.action?spaceKey=COM&title=mtPyTorch+profiler)), update the main.py to profile its performance.
+or you can simply run 'main_profile.py'
+python main_profiler.py -a resnet50 -b 32 -d mtgpu --epochs 90 dataset_dir
+
+
 ## Multi-processing Distributed Data Parallel Training
 
 You should always use the NCCL backend for multi-processing distributed training since it currently provides the best distributed training performance.
