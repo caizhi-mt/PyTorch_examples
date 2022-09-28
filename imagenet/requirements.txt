@@ -2,4 +2,3 @@ pip install --no-deps torchvision
 pip install numpy
 pip install Pillow
 pip install requests
-

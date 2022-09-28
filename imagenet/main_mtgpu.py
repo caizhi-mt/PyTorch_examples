@@ -7,6 +7,8 @@ import warnings
 from enum import Enum
 
 import torch
+import torchvision
+import musa_torch_extension
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
@@ -20,6 +22,10 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 from torch.utils.data import Subset
+#from torch.utils.tensorboard import SummaryWriter
+
+# default `log_dir` is "runs" - we'll be more specific here
+# writer = SummaryWriter('runs/mtgpu_summary')
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -71,6 +77,8 @@ parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
+parser.add_argument("--mtgpu", action="store_true", help="Whether not to use mtgpu")
+parser.add_argument("--test_perf", action="store_true", help="Whether not to test performance")
 parser.add_argument('--multiprocessing-distributed', action='store_true',
                     help='Use multi-processing distributed training to launch '
                          'N processes per node, which has N GPUs. This is the '
@@ -139,7 +147,9 @@ def main_worker(gpu, ngpus_per_node, args):
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
 
-    if not torch.cuda.is_available():
+    if args.mtgpu:
+        model = model.to("mtgpu")
+    elif not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -171,7 +181,10 @@ def main_worker(gpu, ngpus_per_node, args):
             model = torch.nn.DataParallel(model).cuda()
 
     # define loss function (criterion), optimizer, and learning rate scheduler
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    criterion = nn.CrossEntropyLoss()
+    if args.mtgpu:
+        criterion = criterion.to("mtgpu")
+
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
@@ -228,6 +241,20 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ToTensor(),
             normalize,
         ]))
+    # test on CIFAR10
+    #transform_cifar10 = transforms.Compose([
+    #    transforms.RandomResizedCrop(224),
+    #    transforms.RandomHorizontalFlip(),
+    #    transforms.ToTensor(),
+    #    normalize])
+    #train_dataset = torchvision.datasets.CIFAR10(root = '../data',
+    #                                             train=True,
+    #                                             transform = transform_cifar10,
+    #                                             download=True)
+    #test_dataset = torchvision.datasets.CIFAR10(root = '../data',
+    #                                             train=False,
+    #                                             transform = transforms.ToTensor())
+    #val_dataset = test_dataset
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -275,6 +302,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer' : optimizer.state_dict(),
                 'scheduler' : scheduler.state_dict()
             }, is_best)
+    #torch.save(model, 'mtgpu_model.pth')
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -292,14 +320,23 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
+    running_loss = 0.0
+    warmup_steps = 30
+    run_steps = 30
+    real_step = 0
+    total_time = 0.0
     for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        if torch.cuda.is_available():
-            target = target.cuda(args.gpu, non_blocking=True)
+        if args.mtgpu:
+            images = images.to("mtgpu")
+            target = target.to("mtgpu")
+        else:
+            if args.gpu is not None:
+                images = images.cuda(args.gpu, non_blocking=True)
+            if torch.cuda.is_available():
+                target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
         output = model(images)
@@ -315,6 +352,16 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        #running_loss += loss.to("cpu").item()
+        if args.test_perf:
+            real_step = real_step + 1
+            if real_step > warmup_steps:
+                total_time = total_time + time.time() - end
+                if real_step == (warmup_steps + run_steps):
+                    print("===== TEST PERFORMANCE =====")
+                    print("per step time: ", total_time / run_steps)
+                    print("per epoch time: ", total_time / run_steps * len(train_dataloader))
+                    print("throughout: ", args.per_gpu_train_batch_size / (total_time / run_steps))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -322,6 +369,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i + 1)
+        #if i % 100 == 99:
+        #    writer.add_scalar('training loss', running_loss / 100, epoch * len(train_loader) + i)
+        #    running_loss = 0.0
 
 
 def validate(val_loader, model, criterion, args):
@@ -331,10 +381,14 @@ def validate(val_loader, model, criterion, args):
             end = time.time()
             for i, (images, target) in enumerate(loader):
                 i = base_progress + i
-                if args.gpu is not None:
-                    images = images.cuda(args.gpu, non_blocking=True)
-                if torch.cuda.is_available():
-                    target = target.cuda(args.gpu, non_blocking=True)
+                if args.mtgpu:
+                    images = images.to("mtgpu")
+                    target = target.to("mtgpu")
+                else:
+                    if args.gpu is not None:
+                        images = images.cuda(args.gpu, non_blocking=True)
+                    if torch.cuda.is_available():
+                        target = target.cuda(args.gpu, non_blocking=True)
 
                 # compute output
                 output = model(images)
@@ -474,7 +528,7 @@ def accuracy(output, target, topk=(1,)):
         res = []
         for k in topk:
             correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
+            res.append(correct_k.mul_(100.0 / batch_size).cpu())
         return res
 
 
