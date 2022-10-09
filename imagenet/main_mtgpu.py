@@ -360,8 +360,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
                 if real_step == (warmup_steps + run_steps):
                     print("===== TEST PERFORMANCE =====")
                     print("per step time: ", total_time / run_steps)
-                    print("per epoch time: ", total_time / run_steps * len(train_dataloader))
-                    print("throughout: ", args.per_gpu_train_batch_size / (total_time / run_steps))
+                    print("per epoch time: ", total_time / run_steps * len(train_loader))
+                    print("throughout: ", args.batch_size / (total_time / run_steps))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
